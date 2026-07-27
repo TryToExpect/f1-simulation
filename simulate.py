@@ -3,9 +3,11 @@ F1 Monte Carlo Race Simulation — standalone, no database required.
 Data is fetched directly from the OpenF1 API (openf1.org).
 
 Usage:
-  python simulate.py list 2025              # show available races
-  python simulate.py run --session 9574     # simulate a race (default: 10,000 iterations)
+  python simulate.py list 2025                 # show available races
+  python simulate.py run --session 9574        # simulate a past race (default: 10,000 iterations)
   python simulate.py run --session 9574 -n 50000 --laps 57 --circuit Monza
+  python simulate.py predict --circuit Zandvoort   # predict a future/hypothetical race
+                                                    # from the last 40 races (no session data needed)
 """
 
 import sys
@@ -14,6 +16,7 @@ import argparse
 import requests
 import numpy as np
 from collections import defaultdict
+from datetime import datetime, timezone
 
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -63,8 +66,18 @@ VSC_DELTA     = 15.0    # seconds slower under VSC
 # OpenF1 API
 # ---------------------------------------------------------------------------
 
+_http = requests.Session()
+
+
 def fetch(endpoint: str, **params) -> list:
-    r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=30)
+    for attempt in range(6):
+        r = _http.get(f"{BASE_URL}/{endpoint}", params=params, timeout=30)
+        if r.status_code == 429:
+            wait = float(r.headers.get("Retry-After", 1.0)) * (attempt + 1)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
     r.raise_for_status()
     return r.json()
 
@@ -157,6 +170,174 @@ def build_models(session_key: int) -> dict:
 
     print(f"Models ready: {len(models)} drivers\n")
     return models
+
+
+# ---------------------------------------------------------------------------
+# Building models from historical data (for races without session data yet,
+# e.g. future or hypothetical races)
+# ---------------------------------------------------------------------------
+
+def _parse_dt(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def fetch_race_sessions(years_back: int = 8) -> list:
+    """Returns all past (completed) Race sessions from the last `years_back`
+    years, newest first."""
+    now = datetime.now(timezone.utc)
+    sessions = []
+    for year in range(now.year, now.year - years_back, -1):
+        try:
+            yearly = fetch("sessions", session_type="Race", year=year)
+        except requests.HTTPError:
+            continue
+        for s in yearly:
+            ds = s.get("date_start")
+            if ds and not s.get("is_cancelled") and _parse_dt(ds) < now:
+                sessions.append(s)
+    sessions.sort(key=lambda s: s["date_start"], reverse=True)
+    return sessions
+
+
+def find_baseline_session(all_sessions: list, circuit: str) -> dict:
+    """Finds the most recent past race at the given circuit."""
+    matches = [s for s in all_sessions if circuit.lower() in s.get("circuit_short_name", "").lower()]
+    if not matches:
+        known = sorted({s["circuit_short_name"] for s in all_sessions})
+        raise SystemExit(
+            f"No past race found for circuit '{circuit}'. Known circuits: {', '.join(known)}"
+        )
+    return matches[0]
+
+
+def build_predictive_models(baseline: dict, latest: dict, history_sessions: list, decay: float = 0.96) -> tuple:
+    """
+    Builds driver models for a circuit without session data (future/hypothetical
+    race) by combining:
+      - the current grid/team lineup (from the most recent completed race)
+      - relative race pace, reliability and pit stop stats aggregated across
+        `history_sessions` (weighted, most recent races count more)
+      - a baseline pace taken from the most recent past race at the target circuit
+    Returns (models, total_laps).
+    """
+    entry_drivers = {d["driver_number"]: d for d in fetch("drivers", session_key=latest["session_key"])
+                      if d.get("driver_number")}
+
+    pace_deltas: dict[int, list] = defaultdict(list)     # driver_number -> [(delta, weight), ...]
+    dnf_stats:   dict[int, list] = defaultdict(lambda: [0.0, 0.0])  # driver_number -> [weighted_starts, weighted_dnfs]
+    team_pits:   dict[str, list] = defaultdict(list)
+
+    baseline_pace = None
+    total_laps = None
+
+    n_sessions = len(history_sessions)
+    print(f"Building driver models from the last {n_sessions} races...")
+
+    for i, sess in enumerate(history_sessions):
+        sk = sess["session_key"]
+        weight = decay ** i
+        try:
+            laps_raw   = fetch("laps", session_key=sk)
+            pit_raw    = fetch("pit", session_key=sk)
+            result_raw = fetch("session_result", session_key=sk)
+            drv_raw    = (list(entry_drivers.values()) if sk == latest["session_key"]
+                          else fetch("drivers", session_key=sk))
+        except requests.HTTPError as e:
+            print(f"  [{i+1}/{n_sessions}] {sess['circuit_short_name']} {sess['year']} skipped ({e})")
+            continue
+
+        drv_map = {d["driver_number"]: d for d in drv_raw if d.get("driver_number")}
+
+        lap_times: dict[int, list] = defaultdict(list)
+        for lap in laps_raw:
+            dn, dur = lap.get("driver_number"), lap.get("lap_duration")
+            if dn and dur and 60 < dur < 200 and not lap.get("is_pit_out_lap"):
+                lap_times[dn].append(dur)
+
+        medians = {dn: float(np.median(v)) for dn, v in lap_times.items() if len(v) >= 3}
+        if len(medians) >= 3:
+            session_pace = float(np.median(list(medians.values())))
+            for dn, med in medians.items():
+                pace_deltas[dn].append((med - session_pace, weight))
+            if sk == baseline["session_key"]:
+                baseline_pace = session_pace
+
+        for row in result_raw:
+            dn = row.get("driver_number")
+            if dn is None:
+                continue
+            stat = dnf_stats[dn]
+            stat[0] += weight
+            if row.get("dnf"):
+                stat[1] += weight
+
+        if sk == baseline["session_key"]:
+            finishers_laps = [row.get("number_of_laps", 0) for row in result_raw
+                               if not row.get("dnf") and not row.get("dsq")]
+            if finishers_laps:
+                total_laps = max(finishers_laps)
+
+        for pit in pit_raw:
+            dn, dur = pit.get("driver_number"), pit.get("pit_duration")
+            team = drv_map.get(dn, {}).get("team_name", "")
+            if dur and 1.5 < dur < 60 and team:
+                team_pits[team].append(dur)
+
+        print(f"  [{i+1}/{n_sessions}] {sess['circuit_short_name']} {sess['year']} loaded")
+        time.sleep(0.25)
+
+    if baseline_pace is None:
+        raise SystemExit(
+            f"Not enough lap data for the baseline session ({baseline['circuit_short_name']} "
+            f"{baseline['year']}, session {baseline['session_key']})."
+        )
+    if total_laps is None:
+        total_laps = 57
+
+    all_pits = [d for v in team_pits.values() for d in v]
+    global_pit_mean = float(np.mean(all_pits)) if all_pits else 22.5
+
+    models = {}
+    for dn, drv in entry_drivers.items():
+        team = drv.get("team_name", "")
+
+        deltas = pace_deltas.get(dn, [])
+        if deltas:
+            ws = np.array([w for _, w in deltas])
+            ds = np.array([d for d, _ in deltas])
+            avg_delta = float(np.average(ds, weights=ws))
+            std_lt = float(np.std(ds)) if len(ds) >= 3 else 0.6
+        else:
+            avg_delta, std_lt = 0.0, 0.6
+
+        starts, dnfs = dnf_stats.get(dn, [0.0, 0.0])
+        dnf_prob = (dnfs / starts) if starts >= 2 else DNF_PROB.get(team, 0.08)
+        dnf_prob = min(max(dnf_prob, 0.01), 0.5)
+
+        pits = team_pits.get(team, [])
+        pit_mean = float(np.mean(pits)) if len(pits) >= 2 else global_pit_mean
+        pit_std  = max(float(np.std(pits)), 0.3) if len(pits) >= 2 else 1.5
+
+        models[dn] = {
+            "driver_number": dn,
+            "acronym":  drv.get("name_acronym", str(dn)),
+            "team":     team,
+            "mean_lt":  baseline_pace + avg_delta,
+            "std_lt":   max(std_lt, 0.2),
+            "pit_mean": pit_mean,
+            "pit_std":  pit_std,
+            "dnf_prob": dnf_prob,
+            "strategy": [
+                {"compound": "MEDIUM", "lap_start": 1},
+                {"compound": "HARD",   "lap_start": max(total_laps // 2, 2)},
+            ],
+        }
+
+    print(
+        f"\nModels ready: {len(models)} drivers | baseline pace {baseline_pace:.3f}s "
+        f"(from {baseline['circuit_short_name']} {baseline['year']})\n"
+    )
+    return models, total_laps
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +521,30 @@ def cmd_list(year: int):
         time.sleep(0.2)
 
 
+def cmd_predict(circuit: str, laps: int, history: int, n: int):
+    print("Fetching race calendar...")
+    all_sessions = fetch_race_sessions()
+    if not all_sessions:
+        raise SystemExit("No past races found.")
+
+    baseline = find_baseline_session(all_sessions, circuit)
+    latest = all_sessions[0]
+    history_sessions = all_sessions[:history]
+    # Baseline session must be included so its pace can be measured
+    if baseline["session_key"] not in {s["session_key"] for s in history_sessions}:
+        history_sessions.append(baseline)
+
+    print(f"Baseline circuit pace from: {baseline['circuit_short_name']} {baseline['year']} "
+          f"(session {baseline['session_key']})")
+    print(f"Current grid from: latest race, session {latest['session_key']} ({latest['year']})\n")
+
+    models, auto_laps = build_predictive_models(baseline, latest, history_sessions)
+    total_laps = laps if laps else auto_laps
+
+    results = run_monte_carlo(models, n, total_laps, circuit)
+    print_results(results, n, "predict", circuit)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -365,6 +570,19 @@ def main():
     p_run.add_argument("-n",        type=int, default=10000,
                        help="Number of simulations (default 10,000)")
 
+    p_predict = sub.add_parser(
+        "predict",
+        help="Predict a race using historical data (works for future/hypothetical races)",
+    )
+    p_predict.add_argument("--circuit", type=str, required=True,
+                       help="Circuit name, must match OpenF1's circuit_short_name (e.g. Zandvoort, Monza)")
+    p_predict.add_argument("--laps",    type=int, default=None,
+                       help="Number of laps (default: auto-detected from the most recent race at this circuit)")
+    p_predict.add_argument("--history", type=int, default=40,
+                       help="Number of past races to build driver models from (default 40)")
+    p_predict.add_argument("-n",        type=int, default=10000,
+                       help="Number of simulations (default 10,000)")
+
     args = parser.parse_args()
 
     if args.cmd == "list":
@@ -373,6 +591,8 @@ def main():
         models  = build_models(args.session)
         results = run_monte_carlo(models, args.n, args.laps, args.circuit)
         print_results(results, args.n, args.session, args.circuit)
+    elif args.cmd == "predict":
+        cmd_predict(args.circuit, args.laps, args.history, args.n)
     else:
         parser.print_help()
 
